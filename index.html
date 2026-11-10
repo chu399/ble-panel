@@ -155,6 +155,15 @@
     } catch {}
     return toHex(dv);
   }
+  function isCancel(err) {
+    return err && (err.name === 'NotFoundError' || /cancel/i.test(err.message || ''));
+  }
+  function errText(err) {
+    if (err == null) return '未知錯誤';
+    if (typeof err !== 'object') return String(err);
+    const parts = [err.name, err.message, err.code != null ? 'code ' + err.code : ''].filter(Boolean);
+    return [...new Set(parts)].join(' / ') || String(err);
+  }
   function esc(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
@@ -253,17 +262,28 @@
       return;
     }
     const prefix = $('namePrefix').value.trim();
-    const options = prefix
-      ? { filters: [{ namePrefix: prefix }], optionalServices: OPTIONAL_SERVICES }
-      : { acceptAllDevices: true, optionalServices: OPTIONAL_SERVICES };
+    const base = prefix ? { filters: [{ namePrefix: prefix }] } : { acceptAllDevices: true };
+    // Some browsers (e.g. Bluefy) reject unknown/blocklisted optionalServices, so retry with fewer.
+    const attempts = [
+      { ...base, optionalServices: OPTIONAL_SERVICES },
+      { ...base, optionalServices: ['device_information', 'battery_service'] },
+      { ...base },
+    ];
 
-    let device;
-    try {
-      setStatus('請在彈出視窗中選擇裝置 …');
-      device = await navigator.bluetooth.requestDevice(options);
-    } catch (err) {
-      if (err && err.name === 'NotFoundError') setStatus('已取消選擇。');
-      else setStatus('掃描失敗：' + (err && err.message ? err.message : err), 'err');
+    let device, lastErr;
+    setStatus('請在彈出視窗中選擇裝置 …');
+    for (const options of attempts) {
+      try {
+        device = await navigator.bluetooth.requestDevice(options);
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (isCancel(err)) { setStatus('已取消選擇。'); return; }
+      }
+    }
+    if (!device) {
+      setStatus('掃描失敗：' + errText(lastErr) +
+        '。請確認：藍牙已開啟、iOS 設定 → Bluefy → 已允許「藍牙」權限，並重新整理頁面再試。', 'err');
       return;
     }
 
@@ -366,7 +386,7 @@
       return;
     }
     if (typeof navigator.bluetooth.requestLEScan !== 'function') {
-      setStatus('此瀏覽器不支援「搜尋附近裝置」（requestLEScan）。請改用「掃描並選擇裝置」；Chrome 需開啟 chrome://flags/#enable-experimental-web-platform-features。', 'err');
+      setStatus('此瀏覽器不支援「搜尋附近裝置」（requestLEScan，Bluefy 目前也不支援）。請改用「掃描並選擇裝置」，系統視窗會列出附近裝置供選擇；電腦版 Chrome 需開啟 chrome://flags/#enable-experimental-web-platform-features。', 'err');
       return;
     }
     if (leScan) return;
