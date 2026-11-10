@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BLE ID 讀取器</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #fff; --fg: #1d1f23; --muted: #6b7280;
+    --accent: #2563eb; --accent-fg: #fff; --border: #e5e7eb; --err: #dc2626; --ok: #16a34a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111316; --card: #1b1e23; --fg: #e8eaed; --muted: #9aa0a6;
+      --accent: #3b82f6; --border: #2c3036; --err: #f87171; --ok: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 4px 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    appearance: none; border: 0; border-radius: 10px; padding: 12px 16px; font-size: 16px; font-weight: 600;
+    background: var(--accent); color: var(--accent-fg); cursor: pointer; flex: 1 1 auto;
+  }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  label { font-size: 14px; color: var(--muted); display: block; margin: 12px 0 4px; }
+  input[type=text] {
+    width: 100%; padding: 10px 12px; font-size: 16px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 14px; color: var(--muted); }
+  .status { font-size: 14px; color: var(--muted); margin-top: 10px; min-height: 1.5em; word-break: break-word; }
+  .status.err { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .dev h2 { font-size: 18px; margin: 0 0 8px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 0; font-size: 14px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+  .id { display: flex; gap: 8px; align-items: center; }
+  .id code { font-family: var(--mono); font-size: 13px; word-break: break-all; flex: 1; }
+  .copy { flex: 0 0 auto; padding: 6px 10px; font-size: 13px; }
+  details { margin-top: 10px; font-size: 14px; }
+  summary { cursor: pointer; color: var(--accent); }
+  ul.svc { padding-left: 18px; margin: 6px 0; font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  .note { font-size: 13px; color: var(--muted); }
+  .note code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<main>
+  <h1>BLE ID 讀取器</h1>
+  <p class="sub">使用 Web Bluetooth 選擇附近的藍牙裝置並讀取其 ID。iPhone / iPad 請用 <b>Bluefy</b> App 開啟此網頁。</p>
+
+  <section class="card">
+    <div class="row">
+      <button id="scanBtn">掃描並選擇裝置</button>
+    </div>
+    <label for="namePrefix">名稱前綴篩選（選填）</label>
+    <input id="namePrefix" type="text" placeholder="例如：ESP32、Mi、Polar" autocomplete="off">
+    <div class="check">
+      <input id="readGatt" type="checkbox" checked>
+      <label for="readGatt" style="margin:0">選取後連線並讀取 GATT 服務 / 裝置資訊</label>
+    </div>
+    <div id="status" class="status"></div>
+  </section>
+
+  <div id="devices"></div>
+
+  <section class="card note">
+    <b>說明</b><br>
+    • 瀏覽器基於隱私，<b>不會提供 MAC 位址</b>。這裡顯示的 <code>device.id</code> 是瀏覽器為此網站產生的裝置識別碼，同一裝置在同一網站下通常固定不變。<br>
+    • 若裝置有 Device Information 服務（0x180A），會一併讀取序號、型號、製造商等欄位。<br>
+    • 網頁必須透過 <b>HTTPS</b> 開啟（例如 GitHub Pages）。<br>
+    • 已讀過的裝置會保存在本機，重新整理後仍可看到。
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const listEl = $('devices');
+  const STORE_KEY = 'ble-id-reader:devices';
+
+  const DIS = 'device_information';
+  const DIS_CHARS = {
+    manufacturer_name_string: '製造商',
+    model_number_string: '型號',
+    serial_number_string: '序號',
+    hardware_revision_string: '硬體版本',
+    firmware_revision_string: '韌體版本',
+    software_revision_string: '軟體版本',
+    system_id: 'System ID',
+  };
+  // Common services listed in optionalServices so they can be accessed after connecting.
+  const OPTIONAL_SERVICES = [
+    'device_information', 'battery_service', 'generic_access', 'heart_rate',
+    'environmental_sensing', 'human_interface_device', 'tx_power', 'link_loss',
+    'immediate_alert', 'current_time', 'cycling_speed_and_cadence', 'running_speed_and_cadence',
+    0xfe59, 0xfeaa, 0xfee0, 0xfee7, 0xffe0, 0xfff0,
+    '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART
+  ];
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg || '';
+    statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function loadStore() {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch { return {}; }
+  }
+  function saveStore(store) {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch {}
+  }
+  const store = loadStore();
+
+  function toHex(dv) {
+    const out = [];
+    for (let i = 0; i < dv.byteLength; i++) out.push(dv.getUint8(i).toString(16).padStart(2, '0'));
+    return out.join(':').toUpperCase();
+  }
+  function decode(dv, key) {
+    if (key === 'system_id') return toHex(dv);
+    try {
+      const s = new TextDecoder('utf-8').decode(dv).replace(/\0+$/, '');
+      if (/^[\x20-\x7e -￿]*$/.test(s) && s.length) return s;
+    } catch {}
+    return toHex(dv);
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function render() {
+    const items = Object.values(store).sort((a, b) => b.lastSeen - a.lastSeen);
+    listEl.innerHTML = items.map((d) => {
+      const info = Object.entries(d.info || {})
+        .map(([k, v]) => `<dt>${esc(DIS_CHARS[k] || k)}</dt><dd>${esc(v)}</dd>`).join('');
+      const svcs = (d.services || []).map((s) => `<li>${esc(s)}</li>`).join('');
+      return `
+      <section class="card dev">
+        <h2>${esc(d.name || '(未命名裝置)')}</h2>
+        <div class="id"><code>${esc(d.id)}</code>
+          <button class="secondary copy" data-copy="${esc(d.id)}">複製</button></div>
+        <dl style="margin-top:10px">
+          <dt>最後讀取</dt><dd>${esc(new Date(d.lastSeen).toLocaleString())}</dd>
+          ${d.rssi != null ? `<dt>RSSI</dt><dd>${esc(d.rssi)} dBm</dd>` : ''}
+          ${info}
+        </dl>
+        ${svcs ? `<details><summary>GATT 服務 (${d.services.length})</summary><ul class="svc">${svcs}</ul></details>` : ''}
+        ${d.error ? `<div class="status err">${esc(d.error)}</div>` : ''}
+        <div class="row" style="margin-top:10px">
+          <button class="secondary" data-remove="${esc(d.id)}">移除</button>
+        </div>
+      </section>`;
+    }).join('');
+  }
+
+  listEl.addEventListener('click', async (e) => {
+    const copy = e.target.closest('[data-copy]');
+    const remove = e.target.closest('[data-remove]');
+    if (copy) {
+      const text = copy.dataset.copy;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch {}
+        ta.remove();
+      }
+      copy.textContent = '已複製';
+      setTimeout(() => (copy.textContent = '複製'), 1200);
+    } else if (remove) {
+      delete store[remove.dataset.remove];
+      saveStore(store); render();
+    }
+  });
+
+  async function readGatt(device, entry) {
+    setStatus(`連線到 ${device.name || device.id} …`);
+    const server = await device.gatt.connect();
+    try {
+      setStatus('讀取服務列表 …');
+      let services = [];
+      try { services = await server.getPrimaryServices(); } catch {}
+      entry.services = services.map((s) => s.uuid);
+
+      let dis = services.find((s) => s.uuid.startsWith('0000180a'));
+      if (!dis) { try { dis = await server.getPrimaryService(DIS); } catch {} }
+      if (dis) {
+        setStatus('讀取裝置資訊 …');
+        entry.info = entry.info || {};
+        for (const key of Object.keys(DIS_CHARS)) {
+          try {
+            const ch = await dis.getCharacteristic(key);
+            entry.info[key] = decode(await ch.readValue(), key);
+          } catch {}
+        }
+      }
+    } finally {
+      try { device.gatt.disconnect(); } catch {}
+    }
+  }
+
+  function tryWatchAdvertisements(device, entry) {
+    if (typeof device.watchAdvertisements !== 'function') return;
+    const onAdv = (ev) => {
+      entry.rssi = ev.rssi;
+      if (ev.name && !entry.name) entry.name = ev.name;
+      entry.lastSeen = Date.now();
+      saveStore(store); render();
+    };
+    device.addEventListener('advertisementreceived', onAdv);
+    device.watchAdvertisements().catch(() => {});
+    setTimeout(() => {
+      device.removeEventListener('advertisementreceived', onAdv);
+      try { device.unwatchAdvertisements && device.unwatchAdvertisements(); } catch {}
+    }, 8000);
+  }
+
+  async function scan() {
+    if (!navigator.bluetooth) {
+      setStatus('此瀏覽器不支援 Web Bluetooth。iOS 請使用 Bluefy；Android / 電腦請使用 Chrome 或 Edge，並以 HTTPS 開啟。', 'err');
+      return;
+    }
+    const prefix = $('namePrefix').value.trim();
+    const options = prefix
+      ? { filters: [{ namePrefix: prefix }], optionalServices: OPTIONAL_SERVICES }
+      : { acceptAllDevices: true, optionalServices: OPTIONAL_SERVICES };
+
+    let device;
+    try {
+      setStatus('請在彈出視窗中選擇裝置 …');
+      device = await navigator.bluetooth.requestDevice(options);
+    } catch (err) {
+      if (err && err.name === 'NotFoundError') setStatus('已取消選擇。');
+      else setStatus('掃描失敗：' + (err && err.message ? err.message : err), 'err');
+      return;
+    }
+
+    const entry = store[device.id] || { id: device.id };
+    entry.name = device.name || entry.name || '';
+    entry.lastSeen = Date.now();
+    delete entry.error;
+    store[device.id] = entry;
+    saveStore(store); render();
+    setStatus(`已取得 ID：${device.id}`, 'ok');
+
+    tryWatchAdvertisements(device, entry);
+
+    if ($('readGatt').checked && device.gatt) {
+      try {
+        await readGatt(device, entry);
+        setStatus(`完成：${entry.name || device.id}`, 'ok');
+      } catch (err) {
+        entry.error = 'GATT 連線失敗：' + (err && err.message ? err.message : err);
+        setStatus(entry.error, 'err');
+      }
+      entry.lastSeen = Date.now();
+      saveStore(store); render();
+    }
+  }
+
+  $('scanBtn').addEventListener('click', scan);
+  if (!navigator.bluetooth) {
+    setStatus('偵測不到 Web Bluetooth。iOS 請用 Bluefy 開啟本頁；並確認是 HTTPS 網址。', 'err');
+  }
+  render();
+})();
+</script>
+</body>
+</html>
