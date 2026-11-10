@@ -61,6 +61,11 @@
   .rssi { font-family: var(--mono); font-size: 13px; color: var(--muted); white-space: nowrap; }
   .result dl { margin-top: 6px; font-size: 13px; }
   .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
+  .badge { font-size: 13px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
+  .badge.on { color: var(--ok); }
+  .chars-title { font-size: 14px; color: var(--muted); margin-top: 10px; }
+  ul.chars li { margin: 6px 0; }
+  .val { color: var(--fg); background: var(--bg); border-radius: 6px; padding: 4px 6px; margin-top: 2px; }
   .note { font-size: 13px; color: var(--muted); }
   .note code { font-family: var(--mono); }
 </style>
@@ -81,6 +86,10 @@
       <input id="readGatt" type="checkbox" checked>
       <label for="readGatt" style="margin:0">選取後連線並讀取 GATT 服務 / 裝置資訊</label>
     </div>
+    <div class="check">
+      <input id="keepConn" type="checkbox">
+      <label for="keepConn" style="margin:0">保持連線（讀取後不自動斷線，並即時顯示特徵值 / 通知）</label>
+    </div>
     <div id="status" class="status"></div>
   </section>
 
@@ -99,7 +108,8 @@
     • 瀏覽器基於隱私，<b>不會提供 MAC 位址</b>。這裡顯示的 <code>device.id</code> 是瀏覽器為此網站產生的裝置識別碼，同一裝置在同一網站下通常固定不變。<br>
     • 若裝置有 Device Information 服務（0x180A），會一併讀取序號、型號、製造商等欄位。<br>
     • 網頁必須透過 <b>HTTPS</b> 開啟（例如 GitHub Pages）。<br>
-    • 已讀過的裝置會保存在本機，重新整理後仍可看到。
+    • 勾選「保持連線」會維持連線並即時顯示特徵值（R=可讀、W=可寫、N/I=通知），按「斷線」結束。<br>
+    • 已讀過的裝置會保存在本機，重新整理後仍可看到；重新整理後需重新選擇裝置才能再連線。
   </section>
 </main>
 
@@ -168,15 +178,52 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  // ---- 連線中的裝置（只存在記憶體，不寫入 localStorage）----
+  const known = new Map(); // id -> BluetoothDevice（本次開啟頁面時選過的）
+  const live = new Map();  // id -> { chars: Map(key -> {service, uuid, props, value, time, ch}) }
+  const openDetails = new Set();
+  let renderQueuedDev = false;
+  function queueRenderDevices() {
+    if (!renderQueuedDev) { renderQueuedDev = true; requestAnimationFrame(() => { renderQueuedDev = false; render(); }); }
+  }
+
+  function shortUuid(u) {
+    const m = /^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/i.exec(u);
+    return m ? '0x' + m[1].toUpperCase() : u;
+  }
+  function valueText(dv) {
+    if (!dv) return '';
+    const hex = toHex(dv);
+    let txt = '';
+    try {
+      const s = new TextDecoder('utf-8', { fatal: true }).decode(dv).replace(/\0+$/, '');
+      if (s && /^[\x20-\x7e -￿]+$/.test(s)) txt = s;
+    } catch {}
+    return txt ? `${hex}  "${txt}"` : hex;
+  }
+  function propsText(p) {
+    return ['read', 'write', 'writeWithoutResponse', 'notify', 'indicate']
+      .filter((k) => p && p[k]).map((k) => ({ read: 'R', write: 'W', writeWithoutResponse: 'WnR', notify: 'N', indicate: 'I' }[k])).join(' ');
+  }
+
   function render() {
     const items = Object.values(store).sort((a, b) => b.lastSeen - a.lastSeen);
     listEl.innerHTML = items.map((d) => {
       const info = Object.entries(d.info || {})
         .map(([k, v]) => `<dt>${esc(DIS_CHARS[k] || k)}</dt><dd>${esc(v)}</dd>`).join('');
-      const svcs = (d.services || []).map((s) => `<li>${esc(s)}</li>`).join('');
+      const svcs = (d.services || []).map((s) => `<li>${esc(shortUuid(s))}</li>`).join('');
+      const conn = live.get(d.id);
+      const chars = conn ? [...conn.chars.values()].map((c) => `
+          <li><span class="muted">${esc(shortUuid(c.service))} / </span>${esc(shortUuid(c.uuid))}
+            <span class="muted">[${esc(propsText(c.props))}]</span>
+            ${c.value ? `<div class="val">${esc(valueText(c.value))}</div>` : ''}</li>`).join('') : '';
+      let action = '';
+      if (conn) action = `<button data-disconnect="${esc(d.id)}">斷線</button>`;
+      else if (known.has(d.id)) action = `<button class="secondary" data-connect="${esc(d.id)}">重新連線</button>`;
       return `
       <section class="card dev">
-        <h2>${esc(d.name || '(未命名裝置)')}</h2>
+        <h2>${esc(d.name || '(未命名裝置)')}
+          ${conn ? '<span class="badge on">● 已連線</span>' : ''}</h2>
         <div class="id"><code>${esc(d.id)}</code>
           <button class="secondary copy" data-copy="${esc(d.id)}">複製</button></div>
         <dl style="margin-top:10px">
@@ -184,18 +231,28 @@
           ${d.rssi != null ? `<dt>RSSI</dt><dd>${esc(d.rssi)} dBm</dd>` : ''}
           ${info}
         </dl>
-        ${svcs ? `<details><summary>GATT 服務 (${d.services.length})</summary><ul class="svc">${svcs}</ul></details>` : ''}
+        ${svcs ? `<details data-key="svc:${esc(d.id)}" ${openDetails.has('svc:' + d.id) ? 'open' : ''}><summary>GATT 服務 (${d.services.length})</summary><ul class="svc">${svcs}</ul></details>` : ''}
+        ${chars ? `<div class="chars-title">特徵值（即時更新）</div><ul class="svc chars">${chars}</ul>` : ''}
         ${d.error ? `<div class="status err">${esc(d.error)}</div>` : ''}
         <div class="row" style="margin-top:10px">
+          ${action}
           <button class="secondary" data-remove="${esc(d.id)}">移除</button>
         </div>
       </section>`;
     }).join('');
   }
 
+  listEl.addEventListener('toggle', (e) => {
+    const k = e.target.dataset && e.target.dataset.key;
+    if (!k) return;
+    if (e.target.open) openDetails.add(k); else openDetails.delete(k);
+  }, true);
+
   listEl.addEventListener('click', async (e) => {
     const copy = e.target.closest('[data-copy]');
     const remove = e.target.closest('[data-remove]');
+    const disc = e.target.closest('[data-disconnect]');
+    const reconn = e.target.closest('[data-connect]');
     if (copy) {
       const text = copy.dataset.copy;
       try {
@@ -208,15 +265,64 @@
       }
       copy.textContent = '已複製';
       setTimeout(() => (copy.textContent = '複製'), 1200);
+    } else if (disc) {
+      const id = disc.dataset.disconnect;
+      const dev = known.get(id);
+      manualDisc.add(id);
+      try { dev && dev.gatt.disconnect(); } catch {}
+      onDisconnected(id);
+    } else if (reconn) {
+      const dev = known.get(reconn.dataset.connect);
+      const entry = store[reconn.dataset.connect];
+      if (dev && entry) await connectAndRead(dev, entry, true);
     } else if (remove) {
-      delete store[remove.dataset.remove];
+      const id = remove.dataset.remove;
+      const dev = known.get(id);
+      try { dev && dev.gatt && dev.gatt.connected && dev.gatt.disconnect(); } catch {}
+      live.delete(id); known.delete(id);
+      delete store[id];
       saveStore(store); render();
     }
   });
 
-  async function readGatt(device, entry) {
+  const manualDisc = new Set();
+  function onDisconnected(id) {
+    const manual = manualDisc.delete(id);
+    if (!live.has(id)) return;
+    live.delete(id);
+    const name = (store[id] && store[id].name) || id;
+    setStatus(manual ? `已斷線：${name}` : `裝置已斷線：${name}`, manual ? 'ok' : 'err');
+    render();
+  }
+
+  async function subscribeAll(device, services) {
+    const conn = { chars: new Map() };
+    live.set(device.id, conn);
+    for (const svc of services) {
+      let chars = [];
+      try { chars = await svc.getCharacteristics(); } catch { continue; }
+      for (const ch of chars) {
+        const key = svc.uuid + '/' + ch.uuid;
+        const c = { service: svc.uuid, uuid: ch.uuid, props: ch.properties, value: null, ch };
+        conn.chars.set(key, c);
+        if (ch.properties.read) {
+          try { c.value = await ch.readValue(); } catch {}
+        }
+        if (ch.properties.notify || ch.properties.indicate) {
+          ch.addEventListener('characteristicvaluechanged', (ev) => {
+            c.value = ev.target.value; c.time = Date.now();
+            queueRenderDevices();
+          });
+          try { await ch.startNotifications(); } catch {}
+        }
+      }
+    }
+  }
+
+  async function readGatt(device, entry, keep) {
     setStatus(`連線到 ${device.name || device.id} …`);
     const server = await device.gatt.connect();
+    let ok = false;
     try {
       setStatus('讀取服務列表 …');
       let services = [];
@@ -235,9 +341,35 @@
           } catch {}
         }
       }
+      if (keep) {
+        setStatus('讀取特徵值並訂閱通知 …');
+        await subscribeAll(device, services);
+      }
+      ok = true;
     } finally {
-      try { device.gatt.disconnect(); } catch {}
+      if (!keep || !ok) {
+        live.delete(device.id);
+        try { device.gatt.disconnect(); } catch {}
+      }
     }
+  }
+
+  async function connectAndRead(device, entry, keep) {
+    known.set(device.id, device);
+    if (!device._bleReaderHooked) {
+      device._bleReaderHooked = true;
+      device.addEventListener('gattserverdisconnected', () => onDisconnected(device.id));
+    }
+    delete entry.error;
+    try {
+      await readGatt(device, entry, keep);
+      setStatus(keep ? `已連線（保持中）：${entry.name || device.id}` : `完成：${entry.name || device.id}`, 'ok');
+    } catch (err) {
+      entry.error = 'GATT 連線失敗：' + errText(err);
+      setStatus(entry.error, 'err');
+    }
+    entry.lastSeen = Date.now();
+    saveStore(store); render();
   }
 
   function tryWatchAdvertisements(device, entry) {
@@ -297,16 +429,9 @@
 
     tryWatchAdvertisements(device, entry);
 
+    known.set(device.id, device);
     if ($('readGatt').checked && device.gatt) {
-      try {
-        await readGatt(device, entry);
-        setStatus(`完成：${entry.name || device.id}`, 'ok');
-      } catch (err) {
-        entry.error = 'GATT 連線失敗：' + (err && err.message ? err.message : err);
-        setStatus(entry.error, 'err');
-      }
-      entry.lastSeen = Date.now();
-      saveStore(store); render();
+      await connectAndRead(device, entry, $('keepConn').checked);
     }
   }
 
@@ -428,6 +553,8 @@
   });
   $('namePrefix').addEventListener('input', () => { if (results.size) renderResults(); });
 
+  $('keepConn').addEventListener('change', () => { if ($('keepConn').checked) $('readGatt').checked = true; });
+  $('readGatt').addEventListener('change', () => { if (!$('readGatt').checked) $('keepConn').checked = false; });
   $('scanBtn').addEventListener('click', scan);
   if (!navigator.bluetooth) {
     setStatus('偵測不到 Web Bluetooth。iOS 請用 Bluefy 開啟本頁；並確認是 HTTPS 網址。', 'err');
