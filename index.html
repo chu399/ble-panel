@@ -52,6 +52,15 @@
   details { margin-top: 10px; font-size: 14px; }
   summary { cursor: pointer; color: var(--accent); }
   ul.svc { padding-left: 18px; margin: 6px 0; font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  .muted { color: var(--muted); font-weight: 400; font-size: 14px; }
+  .results-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .result { border-top: 1px solid var(--border); padding: 10px 0; }
+  .result:first-child { border-top: 0; }
+  .result-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .result-name { font-weight: 600; word-break: break-word; }
+  .rssi { font-family: var(--mono); font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .result dl { margin-top: 6px; font-size: 13px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
   .note { font-size: 13px; color: var(--muted); }
   .note code { font-family: var(--mono); }
 </style>
@@ -63,15 +72,24 @@
 
   <section class="card">
     <div class="row">
-      <button id="scanBtn">掃描並選擇裝置</button>
+      <button id="searchBtn">搜尋附近裝置</button>
+      <button id="scanBtn" class="secondary">掃描並選擇裝置</button>
     </div>
-    <label for="namePrefix">名稱前綴篩選（選填）</label>
+    <label for="namePrefix">名稱篩選（選填；搜尋結果依名稱包含此文字過濾，選擇裝置時依名稱前綴過濾）</label>
     <input id="namePrefix" type="text" placeholder="例如：ESP32、Mi、Polar" autocomplete="off">
     <div class="check">
       <input id="readGatt" type="checkbox" checked>
       <label for="readGatt" style="margin:0">選取後連線並讀取 GATT 服務 / 裝置資訊</label>
     </div>
     <div id="status" class="status"></div>
+  </section>
+
+  <section class="card" id="resultsCard" hidden>
+    <div class="results-head">
+      <h2 style="font-size:18px;margin:0">搜尋結果 <span id="resultCount" class="muted"></span></h2>
+      <button id="stopBtn" class="secondary copy">停止</button>
+    </div>
+    <div id="results"></div>
   </section>
 
   <div id="devices"></div>
@@ -271,6 +289,124 @@
       saveStore(store); render();
     }
   }
+
+  // ---- 搜尋附近裝置：requestLEScan 持續接收廣播，列出所有結果 ----
+  const SEARCH_MS = 20000;
+  const results = new Map(); // id -> result
+  let leScan = null;
+  let searchTimer = null;
+  let renderQueued = false;
+
+  function mfgText(map) {
+    if (!map || !map.size) return '';
+    const parts = [];
+    map.forEach((dv, companyId) => {
+      parts.push('0x' + companyId.toString(16).padStart(4, '0').toUpperCase() + ' → ' + toHex(dv));
+    });
+    return parts.join('\n');
+  }
+
+  function renderResults() {
+    renderQueued = false;
+    const filter = $('namePrefix').value.trim().toLowerCase();
+    const items = [...results.values()]
+      .filter((r) => !filter || (r.name || '').toLowerCase().includes(filter))
+      .sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
+    $('resultCount').textContent = `(${items.length}${filter ? ' / ' + results.size : ''})`;
+    $('results').innerHTML = items.length ? items.map((r) => `
+      <div class="result">
+        <div class="result-top">
+          <span class="result-name">${esc(r.name || '(未命名裝置)')}</span>
+          <span class="rssi">${r.rssi != null ? esc(r.rssi) + ' dBm' : ''}</span>
+        </div>
+        <div class="id"><code>${esc(r.id)}</code>
+          <button class="secondary copy" data-copy="${esc(r.id)}">複製</button></div>
+        <dl>
+          ${r.txPower != null ? `<dt>TX Power</dt><dd>${esc(r.txPower)} dBm</dd>` : ''}
+          ${r.uuids && r.uuids.length ? `<dt>服務 UUID</dt><dd>${r.uuids.map(esc).join('<br>')}</dd>` : ''}
+          ${r.mfg ? `<dt>製造商資料</dt><dd>${esc(r.mfg).replace(/\n/g, '<br>')}</dd>` : ''}
+          <dt>收到次數</dt><dd>${r.count}</dd>
+        </dl>
+      </div>`).join('')
+      : `<div class="empty">${leScan ? '搜尋中，尚未發現裝置 …' : '沒有找到裝置。'}</div>`;
+  }
+  function queueRender() {
+    if (!renderQueued) { renderQueued = true; requestAnimationFrame(renderResults); }
+  }
+
+  function onAdvertisement(ev) {
+    const id = ev.device.id;
+    const r = results.get(id) || { id, count: 0 };
+    r.name = ev.device.name || ev.name || r.name || '';
+    if (ev.rssi != null) r.rssi = ev.rssi;
+    if (ev.txPower != null) r.txPower = ev.txPower;
+    if (ev.uuids && ev.uuids.length) r.uuids = [...ev.uuids];
+    const mfg = mfgText(ev.manufacturerData);
+    if (mfg) r.mfg = mfg;
+    r.count++;
+    results.set(id, r);
+    queueRender();
+  }
+
+  function stopSearch(msg) {
+    clearTimeout(searchTimer);
+    navigator.bluetooth && navigator.bluetooth.removeEventListener('advertisementreceived', onAdvertisement);
+    if (leScan) { try { leScan.stop(); } catch {} }
+    leScan = null;
+    $('searchBtn').disabled = false;
+    $('searchBtn').textContent = '搜尋附近裝置';
+    $('stopBtn').hidden = true;
+    setStatus(msg || `搜尋結束，共找到 ${results.size} 個裝置。`, 'ok');
+    renderResults();
+  }
+
+  async function search() {
+    if (!navigator.bluetooth) {
+      setStatus('此瀏覽器不支援 Web Bluetooth。iOS 請使用 Bluefy 並以 HTTPS 開啟。', 'err');
+      return;
+    }
+    if (typeof navigator.bluetooth.requestLEScan !== 'function') {
+      setStatus('此瀏覽器不支援「搜尋附近裝置」（requestLEScan）。請改用「掃描並選擇裝置」；Chrome 需開啟 chrome://flags/#enable-experimental-web-platform-features。', 'err');
+      return;
+    }
+    if (leScan) return;
+    results.clear();
+    $('resultsCard').hidden = false;
+    $('stopBtn').hidden = false;
+    $('searchBtn').disabled = true;
+    $('searchBtn').textContent = '搜尋中 …';
+    setStatus('正在搜尋附近的 BLE 裝置 …');
+    renderResults();
+    try {
+      navigator.bluetooth.addEventListener('advertisementreceived', onAdvertisement);
+      leScan = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements: true, keepRepeatedDevices: true });
+      renderResults();
+      searchTimer = setTimeout(() => stopSearch(), SEARCH_MS);
+    } catch (err) {
+      leScan = null;
+      stopSearch(err && err.name === 'NotAllowedError'
+        ? '已拒絕搜尋權限。'
+        : '搜尋失敗：' + (err && err.message ? err.message : err));
+      statusEl.className = 'status err';
+    }
+  }
+
+  $('searchBtn').addEventListener('click', search);
+  $('stopBtn').addEventListener('click', () => stopSearch());
+  $('results').addEventListener('click', (e) => {
+    const copy = e.target.closest('[data-copy]');
+    if (!copy) return;
+    const text = copy.dataset.copy;
+    (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).catch(() => {
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch {}
+      ta.remove();
+    });
+    copy.textContent = '已複製';
+    setTimeout(() => (copy.textContent = '複製'), 1200);
+  });
+  $('namePrefix').addEventListener('input', () => { if (results.size) renderResults(); });
 
   $('scanBtn').addEventListener('click', scan);
   if (!navigator.bluetooth) {

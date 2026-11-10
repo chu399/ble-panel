@@ -6,8 +6,9 @@
 
 1. 將本 repo 透過 HTTPS 提供（例如開啟 GitHub Pages：Settings → Pages → Branch 選擇此分支 / root）。
 2. 在 iPhone 上開啟 Bluefy，輸入網址，例如 `https://<帳號>.github.io/ble-panel/`。
-3. 按「掃描並選擇裝置」，在彈出清單中選擇裝置，即可看到裝置 ID。
-4. 勾選「連線並讀取 GATT」時，會額外列出服務 UUID，以及 Device Information（0x180A）中的製造商、型號、序號等。
+3. 按「搜尋附近裝置」會持續搜尋 20 秒（可按「停止」），列出所有收到廣播的裝置：名稱、ID、RSSI、服務 UUID、製造商資料，依訊號強弱排序；可用名稱篩選過濾。需瀏覽器支援 `requestLEScan`。
+4. 或按「掃描並選擇裝置」，在彈出清單中選擇裝置，即可看到裝置 ID。
+5. 勾選「連線並讀取 GATT」時，會額外列出服務 UUID，以及 Device Information（0x180A）中的製造商、型號、序號等。
 
 Android / 桌機的 Chrome、Edge 也可直接使用。
 
